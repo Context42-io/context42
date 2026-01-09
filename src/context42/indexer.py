@@ -29,56 +29,205 @@ def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def chunk_markdown(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+def chunk_markdown(text: str, chunk_size: int = 500, overlap: int = 50, min_chunk_size: int = 100) -> list[str]:
     """
-    Chunk markdown text while preserving semantic context.
+    Chunk markdown text ensuring each chunk contains meaningful content.
+
+    CRITICAL FIX (v0.2.1): This function was creating header-only chunks that were
+    useless for LLM search. Now ensures every chunk has header + real content.
 
     Algorithm:
-    1. Split by headers (##, ###, etc)
-    2. If section > chunk_size:
-       a. Split by paragraphs (blank lines)
-       b. If paragraph > chunk_size:
-          c. Split by sentences (., !, ?)
-          d. NEVER split mid-sentence
-    3. Apply overlap between adjacent chunks
-    4. Preserve context: include parent header at chunk start
+    1. Parse markdown into (header, content) pairs
+    2. Accumulate small sections until reaching min_chunk_size
+    3. Split large sections with header preserved
+    4. Validate chunks have sufficient non-header content
 
     Args:
         text: Markdown text to chunk
         chunk_size: Target chunk size in CHARACTERS
         overlap: Overlap between chunks in CHARACTERS
+        min_chunk_size: Minimum content size to create useful chunks
 
     Returns:
-        List of text chunks
+        List of text chunks, each with header + meaningful content
     """
     chunks = []
 
-    # Split by headers first
+    # Parse into (header, content) pairs
+    sections = _parse_sections(text)
+
+    # Accumulator for small sections
+    accumulated_header = ""
+    accumulated_content = ""
+
+    for header, content in sections:
+        # Skip sections with no real content (empty or whitespace only)
+        content_stripped = content.strip()
+        if not content_stripped:
+            continue
+
+        # If accumulated content + new content fits and stays useful
+        total_content = accumulated_content + "\n\n" + content_stripped if accumulated_content else content_stripped
+
+        # If this section is too small on its own, accumulate it
+        if len(content_stripped) < min_chunk_size:
+            if not accumulated_header:
+                accumulated_header = header
+            accumulated_content = total_content
+            continue
+
+        # Process accumulated content if any
+        if accumulated_content:
+            full_accumulated = f"{accumulated_header}\n\n{accumulated_content}".strip()
+            if len(full_accumulated) > chunk_size:
+                # Split large accumulated section
+                chunks.extend(_split_large_section(accumulated_header, accumulated_content, chunk_size, overlap))
+            else:
+                chunks.append(full_accumulated)
+            accumulated_header = ""
+            accumulated_content = ""
+
+        # Process current section
+        full_section = f"{header}\n\n{content_stripped}".strip()
+        if len(full_section) > chunk_size:
+            # Split large section
+            chunks.extend(_split_large_section(header, content_stripped, chunk_size, overlap))
+        else:
+            chunks.append(full_section)
+
+    # Don't forget last accumulated content
+    if accumulated_content:
+        full_accumulated = f"{accumulated_header}\n\n{accumulated_content}".strip()
+        chunks.append(full_accumulated)
+
+    # Final validation: ensure chunks have meaningful content
+    final_chunks = []
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+
+        # Check that chunk has content beyond just header(s)
+        lines = chunk.strip().split('\n')
+        non_header_lines = [l for l in lines if l.strip() and not l.strip().startswith('#')]
+        non_header_content = '\n'.join(non_header_lines).strip()
+
+        # Require at least some real content (not just headers)
+        if len(non_header_content) >= 20:  # Minimum useful content
+            final_chunks.append(chunk)
+        # Silently skip header-only or near-empty chunks
+
+    return final_chunks
+
+
+def _parse_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Parse markdown into (header, content) pairs.
+
+    This separates headers from their content, which is critical for
+    preventing header-only chunks.
+
+    Handles header hierarchy: sub-headers (###, ####) inherit their immediate
+    parent header (##) for context when the parent has no direct content.
+
+    Args:
+        text: Markdown text
+
+    Returns:
+        List of (header, content) tuples with headers preserving hierarchy
+    """
     header_pattern = r'^(#{1,6}\s+.+)$'
     lines = text.split('\n')
 
+    sections = []
+    recent_h2 = ""  # Most recent ## header (for sub-header context)
     current_header = ""
-    current_section = []
+    current_content_lines = []
 
     for line in lines:
-        if re.match(header_pattern, line):
-            # Process previous section if exists
-            if current_section:
-                section_text = '\n'.join(current_section)
-                chunks.extend(_chunk_section(section_text, current_header, chunk_size, overlap))
+        header_match = re.match(header_pattern, line)
+        if header_match:
+            # Save previous section
+            if current_header or current_content_lines:
+                content = '\n'.join(current_content_lines)
+                sections.append((current_header, content))
+
+            # Determine header level
+            header_level = len(line) - len(line.lstrip('#'))
+
+            # Update recent H2 if this is a level 2 header
+            if header_level == 2:
+                recent_h2 = line
+
+            # Build header with parent context if this is a sub-header
+            if header_level > 2 and recent_h2:
+                # Sub-header: include parent ## for context
+                full_header = f"{recent_h2}\n\n{line}"
+            else:
+                # Top-level header or no parent
+                full_header = line
 
             # Start new section
-            current_header = line
-            current_section = [line]
+            current_header = full_header
+            current_content_lines = []
         else:
-            current_section.append(line)
+            # Content lines (not headers)
+            current_content_lines.append(line)
 
-    # Process last section
-    if current_section:
-        section_text = '\n'.join(current_section)
-        chunks.extend(_chunk_section(section_text, current_header, chunk_size, overlap))
+    # Save last section
+    if current_header or current_content_lines:
+        content = '\n'.join(current_content_lines)
+        sections.append((current_header, content))
 
-    return [c for c in chunks if c.strip()]
+    return sections
+
+
+def _split_large_section(header: str, content: str, chunk_size: int, overlap: int) -> list[str]:
+    """
+    Split a large section into multiple chunks, each with the header.
+
+    Args:
+        header: Section header
+        content: Section content (without header)
+        chunk_size: Target chunk size
+        overlap: Overlap size
+
+    Returns:
+        List of chunks, each prefixed with header
+    """
+    chunks = []
+
+    # Split by paragraphs first
+    paragraphs = re.split(r'\n\s*\n', content)
+
+    current_chunk_content = ""
+    header_prefix = f"{header}\n\n" if header else ""
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        potential_size = len(header_prefix) + len(current_chunk_content) + len(para) + 2
+
+        if potential_size > chunk_size and current_chunk_content:
+            # Save current chunk with header
+            chunks.append(f"{header_prefix}{current_chunk_content}".strip())
+
+            # Start new chunk with overlap
+            overlap_text = _get_smart_overlap(current_chunk_content, overlap)
+            current_chunk_content = overlap_text + "\n\n" + para if overlap_text else para
+        else:
+            # Add to current chunk
+            if current_chunk_content:
+                current_chunk_content += "\n\n" + para
+            else:
+                current_chunk_content = para
+
+    # Save last chunk
+    if current_chunk_content:
+        chunks.append(f"{header_prefix}{current_chunk_content}".strip())
+
+    return chunks
 
 
 def _chunk_section(section_text: str, header: str, chunk_size: int, overlap: int) -> list[str]:

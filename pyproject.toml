@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "context42-io"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for personal coding instructions and documentation"
 readme = "README.md"
 license = "MIT"
