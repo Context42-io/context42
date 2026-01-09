@@ -1,6 +1,8 @@
 """CLI commands for Context42."""
 
 from pathlib import Path
+from typing import Annotated, Optional
+from functools import wraps
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -19,9 +21,37 @@ app = typer.Typer(
 console = Console()
 
 
+def handle_errors(func):
+    """Decorator for friendly error handling."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except typer.Exit:
+            raise  # Re-raise Exit for Typer to handle
+        except FileNotFoundError as e:
+            console.print(f"[red]Error: File not found - {e.filename}[/red]")
+            raise typer.Exit(1)
+        except PermissionError as e:
+            console.print(f"[red]Error: Permission denied - {e.filename}[/red]")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            console.print("[dim]Run with --verbose for details.[/dim]")
+            raise typer.Exit(1)
+    return wrapper
+
+
 @app.callback(invoke_without_command=True)
-def main(ctx: typer.Context):
+def main(
+    ctx: typer.Context,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show detailed output")] = False,
+):
     """Context42 - MCP server for personal coding instructions."""
+    if verbose:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+
     if ctx.invoked_subcommand is None:
         console.print("[yellow]Context42 - MCP server for personal coding instructions[/yellow]")
         console.print("\nUse --help for available commands")
@@ -33,6 +63,7 @@ def main(ctx: typer.Context):
 
 
 @app.command()
+@handle_errors
 def add(
     path: str = typer.Argument(..., help="Path to source directory"),
     name: str = typer.Option(..., "--name", "-n", help="Unique source name")
@@ -73,6 +104,7 @@ def add(
 
 
 @app.command()
+@handle_errors
 def list():
     """List all sources and their status."""
     settings.ensure_dirs()
@@ -118,6 +150,182 @@ def list():
 
 
 @app.command()
+@handle_errors
+def remove(
+    name: Annotated[str, typer.Argument(help="Name of the source to remove")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation")] = False,
+):
+    """Remove a source and all its indexed chunks."""
+    settings.ensure_dirs()
+    source_storage = SourceStorage(settings.db_path)
+
+    try:
+        # Check if source exists
+        source = source_storage.get_source(name)
+        if not source:
+            console.print(f"[red]Error: Source '{name}' not found.[/red]")
+            console.print("\nAvailable sources:")
+            sources = source_storage.list_sources()
+            for s in sources:
+                console.print(f"  - {s.name}")
+            raise typer.Exit(1)
+
+        # Confirmation
+        if not yes:
+            confirm = typer.confirm(
+                f"Remove source '{name}' and all its chunks?",
+                default=False
+            )
+            if not confirm:
+                console.print("[yellow]Cancelled.[/yellow]")
+                raise typer.Exit(0)
+
+        # Remove chunks from LanceDB
+        vector_storage = VectorStorage(settings.vectors_path)
+        vector_storage.init_db()
+        chunks_removed = vector_storage.delete_by_source(name)
+
+        # Remove from SQLite
+        source_storage.remove_source(name)
+
+        console.print(f"[green]✓ Removed source '{name}' ({chunks_removed} chunks deleted)[/green]")
+
+    finally:
+        source_storage.close()
+
+
+@app.command()
+@handle_errors
+def status():
+    """Show detailed statistics about indexed sources."""
+    settings.ensure_dirs()
+    source_storage = SourceStorage(settings.db_path)
+
+    try:
+        sources = source_storage.list_sources()
+        if not sources:
+            console.print("[yellow]No sources configured.[/yellow]")
+            console.print("Run 'c42 add <path> --name <n>' to add a source.")
+            raise typer.Exit(0)
+
+        # Get vector storage statistics
+        vector_storage = VectorStorage(settings.vectors_path)
+        vector_storage.init_db()
+
+        try:
+            stats = vector_storage.get_stats()
+        except Exception:
+            # Table might not exist yet
+            stats = {"total_chunks": 0, "sources": {}, "storage_size_bytes": 0}
+
+        # Header
+        console.print("\n[bold]Context42 Status[/bold]\n")
+
+        # Sources summary
+        indexed = [s for s in sources if s.indexed_at]
+        pending = [s for s in sources if not s.indexed_at]
+
+        console.print(f"[cyan]Sources:[/cyan] {len(sources)} total, {len(indexed)} indexed, {len(pending)} pending")
+        console.print(f"[cyan]Chunks:[/cyan]  {stats['total_chunks']:,}")
+        console.print(f"[cyan]Storage:[/cyan] {_format_size(stats['storage_size_bytes'])}")
+        console.print(f"[cyan]Model:[/cyan]   {settings.embedding_model}")
+
+        # Chunks per source
+        if stats["sources"]:
+            console.print("\n[bold]Chunks per Source:[/bold]")
+            table = Table(show_header=True)
+            table.add_column("Source", style="cyan")
+            table.add_column("Chunks", justify="right")
+
+            for source_name, chunk_count in sorted(stats["sources"].items()):
+                table.add_row(source_name, f"{chunk_count:,}")
+
+            console.print(table)
+
+        # Pending sources
+        if pending:
+            console.print("\n[yellow]Pending indexing:[/yellow]")
+            for s in pending:
+                console.print(f"  - {s.name}")
+            console.print("\nRun 'c42 index' to index pending sources.")
+
+    finally:
+        source_storage.close()
+
+
+@app.command()
+@handle_errors
+def search(
+    query: Annotated[str, typer.Argument(help="Search query")],
+    top_k: Annotated[int, typer.Option("--top-k", "-k", help="Number of results")] = 5,
+    source: Annotated[Optional[str], typer.Option("--source", "-s", help="Filter by source")] = None,
+):
+    """Search indexed instructions (for testing/debugging)."""
+    settings.ensure_dirs()
+
+    # Check for indexed sources
+    source_storage = SourceStorage(settings.db_path)
+
+    try:
+        sources = source_storage.list_sources()
+        indexed = [s for s in sources if s.indexed_at]
+
+        if not indexed:
+            console.print("[red]Error: No indexed sources.[/red]")
+            console.print("Run 'c42 add' and 'c42 index' first.")
+            raise typer.Exit(1)
+
+        # Initialize search engine
+        from .search import SearchEngine
+
+        vector_storage = VectorStorage(settings.vectors_path)
+        vector_storage.init_db()
+        embedder = Embedder(settings.embedding_model)
+        engine = SearchEngine(vector_storage, embedder)
+
+        # Execute search
+        console.print(f"[dim]Searching for: {query}[/dim]\n")
+
+        results = engine.search(query, top_k=top_k)
+
+        # Filter by source if specified
+        if source:
+            results = [r for r in results if r.source_name == source]
+
+        if not results:
+            console.print("[yellow]No results found.[/yellow]")
+            raise typer.Exit(0)
+
+        # Display results
+        for i, r in enumerate(results, 1):
+            # Color score based on value
+            score_color = "green" if r.score >= 0.8 else "yellow" if r.score >= 0.6 else "red"
+            console.print(f"[bold]#{i}[/bold] [{score_color}]Score: {r.score:.4f}[/{score_color}]")
+            console.print(f"    [cyan]Source:[/cyan] {r.source_name}")
+            console.print(f"    [cyan]File:[/cyan]   {r.file_path}")
+
+            # Truncated text preview
+            text_preview = r.text[:200].replace("\n", " ")
+            if len(r.text) > 200:
+                text_preview += "..."
+            console.print(f"    [dim]{text_preview}[/dim]")
+            console.print()
+
+    finally:
+        source_storage.close()
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format bytes to human readable size."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+@app.command()
+@handle_errors
 def index():
     """Index all pending sources (creates vector embeddings)."""
     settings.ensure_dirs()
@@ -162,6 +370,7 @@ def index():
 
 
 @app.command()
+@handle_errors
 def serve():
     """Start the MCP server."""
     settings.ensure_dirs()

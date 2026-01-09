@@ -124,15 +124,19 @@ class SourceStorage:
         )
         self.conn.commit()
 
-    def remove_source(self, name: str) -> None:
+    def remove_source(self, name: str) -> bool:
         """
         Remove a source.
 
         Args:
             name: Source name
+
+        Returns:
+            True if removed, False if source didn't exist
         """
-        self.conn.execute("DELETE FROM sources WHERE name = ?", (name,))
+        cursor = self.conn.execute("DELETE FROM sources WHERE name = ?", (name,))
         self.conn.commit()
+        return cursor.rowcount > 0
 
     def close(self) -> None:
         """Close database connection."""
@@ -237,17 +241,28 @@ class VectorStorage:
             # If search fails (table empty, etc), assume doesn't exist
             return False
 
-    def delete_by_source(self, source_name: str) -> None:
+    def delete_by_source(self, source_name: str) -> int:
         """
         Delete all chunks from a source.
 
         Args:
             source_name: Source name to delete
+
+        Returns:
+            Number of chunks deleted
         """
         if self.table is None:
-            return
+            return 0
 
+        # Count before deleting
+        count_before = self.table.count_rows()
+
+        # Delete chunks
         self.table.delete(f"source_name = '{source_name}'")
+
+        # Count after to calculate deleted
+        count_after = self.table.count_rows()
+        return count_before - count_after
 
     def get_chunks_by_source(self, source_name: str) -> list[dict]:
         """
@@ -264,3 +279,40 @@ class VectorStorage:
 
         results = self.table.search().where(f"source_name = '{source_name}'").to_list()
         return results
+
+    def get_stats(self) -> dict:
+        """
+        Get statistics about vector storage.
+
+        Returns:
+            Dictionary with:
+                - total_chunks: Total number of chunks
+                - sources: Dict mapping source_name to chunk count
+                - storage_size_bytes: Total storage size in bytes
+        """
+        if self.table is None:
+            return {
+                "total_chunks": 0,
+                "sources": {},
+                "storage_size_bytes": 0,
+            }
+
+        # Total chunks
+        total = self.table.count_rows()
+
+        # Count per source - convert to pandas and group
+        df = self.table.to_pandas()
+        sources = df.groupby("source_name").size().to_dict() if not df.empty else {}
+
+        # Storage size - sum all files in vectors directory
+        size = sum(
+            f.stat().st_size
+            for f in self.vectors_path.rglob("*")
+            if f.is_file()
+        )
+
+        return {
+            "total_chunks": total,
+            "sources": sources,
+            "storage_size_bytes": size,
+        }
