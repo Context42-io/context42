@@ -5,20 +5,38 @@ build-backend = "hatchling.build"
 [project]
 name = "context42-io"
 version = "0.3.3"
-description = "MCP server for personal coding instructions and documentation"
+description = "MCP server for semantic search over personal coding instructions and documentation"
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.11"
-authors = [
-    { name = "Context42 Team", email = "team@context42.io" }
+license = "MIT"
+keywords = [
+    "mcp",
+    "llm",
+    "semantic-search",
+    "documentation",
+    "code-assistant",
+    "claude",
+    "vector-search",
+    "embeddings"
 ]
-keywords = ["mcp", "llm", "documentation", "code-assistant"]
+authors = [
+    {name = "Daniel Gines", email = "dangines@gmail.com"}
+]
+maintainers = [
+    {name = "Daniel Gines", email = "dangines@gmail.com"}
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Text Processing :: Indexing",
 ]
 dependencies = [
     "fastmcp>=0.1.0",
@@ -37,6 +55,17 @@ context42 = "context42.cli:app"
 [project.urls]
 Homepage = "https://github.com/context42-io/context42"
 Repository = "https://github.com/context42-io/context42"
+Changelog = "https://github.com/context42-io/context42/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context42"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "*.md",
+    "!README.md",
+    "!CHANGELOG.md",
+    "!LICENSE",
+    ".claude/",
+    ".gitignore",
+]
