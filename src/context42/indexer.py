@@ -2,11 +2,17 @@
 
 import hashlib
 import re
-import signal
 from pathlib import Path
 from typing import Optional
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    MofNCompleteColumn,
+    TimeElapsedColumn,
+)
 
 from fastembed import TextEmbedding
 
@@ -396,17 +402,6 @@ class Indexer:
         self.vector_storage = vector_storage
         self.embedder = embedder
         self.settings = settings
-        self._interrupted = False
-
-    def _handle_interrupt(self, signum, frame):
-        """Handle Ctrl+C gracefully."""
-        if self._interrupted:
-            # Second Ctrl+C = force quit
-            console.print("\n[red]Force quit![/red]")
-            raise KeyboardInterrupt
-
-        self._interrupted = True
-        console.print("\n[yellow]Interrupt received. Finishing current batch...[/yellow]")
 
     def check_model_compatibility(self, source_name: str) -> bool:
         """
@@ -432,52 +427,64 @@ class Indexer:
 
         return True
 
-    def _process_batch(
+    def _print_summary(
         self,
-        chunks: list[dict],
-        batch_num: int,
-        total_batches: int
-    ) -> int:
+        source_name: str,
+        is_first_index: bool,
+        skipped_chunks: int,
+        total_indexed: int,
+        total_batches: int,
+        total_found: int
+    ) -> None:
         """
-        Process a single batch: embed and store.
+        Print indexing summary with appropriate warnings.
 
         Args:
-            chunks: List of chunk dicts (without vectors yet)
-            batch_num: Current batch number (1-indexed)
-            total_batches: Total number of batches
-
-        Returns:
-            Number of chunks processed
+            source_name: Source name
+            is_first_index: Whether this is the first time indexing this source
+            skipped_chunks: Number of chunks skipped (already existed)
+            total_indexed: Number of chunks indexed
+            total_batches: Number of batches processed
+            total_found: Total chunks found (skipped + indexed)
         """
-        if not chunks:
-            return 0
+        console.print()  # Blank line after progress bars
 
-        console.print(
-            f"[blue]Embedding batch {batch_num}/{total_batches} "
-            f"({len(chunks)} chunks)...[/blue]"
-        )
-
-        # Generate embeddings for this batch
-        texts = [chunk["text"] for chunk in chunks]
-        embeddings = self.embedder.embed(texts)
-
-        # Add vectors to chunks
-        for chunk, embedding in zip(chunks, embeddings):
-            chunk["vector"] = embedding.tolist()
-
-        # Insert batch to LanceDB
-        self.vector_storage.add_chunks(chunks)
-
-        return len(chunks)
+        # Detect ghost source situation
+        if is_first_index and skipped_chunks > 0 and total_indexed == 0:
+            console.print(f"[yellow]⚠️  Warning: All {skipped_chunks} chunks already exist in other sources.[/yellow]")
+            console.print(f"[yellow]   Source '{source_name}' has no unique content to search.[/yellow]")
+            console.print()
+            console.print("[dim]   This may happen when:[/dim]")
+            console.print("[dim]   - The same directory is indexed under different names[/dim]")
+            console.print("[dim]   - Subdirectories overlap with existing sources[/dim]")
+            console.print()
+            console.print("[dim]   Consider:[/dim]")
+            console.print(f"[dim]   - Remove this source: c42 remove {source_name}[/dim]")
+            console.print("[dim]   - Or adjust priority of existing source with same content[/dim]")
+            console.print()
+            console.print(f"[yellow]✓ Indexing complete: 0 chunks created[/yellow]")
+        elif skipped_chunks > 0 and total_indexed > 0:
+            # Some new, some skipped - normal partial update
+            console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
+            console.print(f"[green]✓ Indexed {total_indexed} chunks in {total_batches} batch(es)[/green]")
+        elif skipped_chunks > 0 and not is_first_index:
+            # Re-index - all already exist
+            console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
+            console.print(f"[green]✓ All chunks already indexed (idempotent)[/green]")
+        elif total_indexed > 0:
+            # Fresh index
+            console.print(f"[green]✓ Indexed {total_indexed} chunks in {total_batches} batch(es)[/green]")
+        elif total_found == 0:
+            console.print("[yellow]No chunks found to index (empty or invalid files)[/yellow]")
+        else:
+            console.print(f"[green]✓ All chunks already indexed (idempotent)[/green]")
 
     def index_source(self, source_name: str) -> int:
         """
-        Index a single source using batch processing.
+        Index a single source using two-phase processing with progress bars.
 
-        Processes chunks in batches to:
-        - Control memory usage
-        - Provide granular progress feedback
-        - Enable partial recovery on interruption
+        Phase 1: Read files and chunk (accumulate all chunks)
+        Phase 2: Embed and insert (in batches with progress bar)
 
         Args:
             source_name: Source name to index
@@ -488,178 +495,165 @@ class Indexer:
         Raises:
             ValueError: If source not found
         """
-        # Setup interrupt handler
-        self._interrupted = False
-        original_handler = signal.signal(signal.SIGINT, self._handle_interrupt)
+        # Get source
+        source = self.source_storage.get_source(source_name)
+        if not source:
+            raise ValueError(f"Source '{source_name}' not found")
 
-        try:
-            # Get source
-            source = self.source_storage.get_source(source_name)
-            if not source:
-                raise ValueError(f"Source '{source_name}' not found")
+        # Check if first index (for warning logic)
+        is_first_index = source.indexed_at is None
 
-            # Check if this is first indexing (for ghost source detection)
-            is_first_index = source.indexed_at is None
+        # Check model compatibility
+        self.check_model_compatibility(source_name)
 
-            # Check model compatibility
-            self.check_model_compatibility(source_name)
+        console.print(f"\n[bold blue]Indexing source: {source_name}[/bold blue]")
+        console.print(f"[dim]Path: {source.path}[/dim]")
 
-            console.print(f"\n[bold blue]Indexing source: {source_name}[/bold blue]")
-            console.print(f"[dim]Path: {source.path}[/dim]")
+        # Find all .md files
+        source_path = Path(source.path).expanduser()
+        if not source_path.exists():
+            raise ValueError(f"Source path does not exist: {source.path}")
 
-            # Find all .md files
-            source_path = Path(source.path).expanduser()
-            if not source_path.exists():
-                raise ValueError(f"Source path does not exist: {source.path}")
+        md_files = list(source_path.rglob("*.md"))
+        console.print(f"[blue]Found {len(md_files)} markdown files[/blue]")
 
-            md_files = list(source_path.rglob("*.md"))
-            console.print(f"[blue]Found {len(md_files)} markdown files[/blue]")
+        if not md_files:
+            console.print("[yellow]No markdown files found[/yellow]")
+            return 0
 
-            if not md_files:
-                console.print("[yellow]No markdown files found[/yellow]")
-                return 0
+        # Pre-load embedding model (shows loading message before progress bars)
+        self.embedder._ensure_model()
 
-            # Process files and collect chunks in batches
-            total_chunks_indexed = 0
-            current_batch: list[dict] = []
-            batch_num = 0
-            skipped_chunks = 0
+        console.print()  # Blank line
 
-            # Estimate total batches for progress (rough estimate)
-            estimated_chunks_per_file = 10  # Rough average
-            estimated_total = len(md_files) * estimated_chunks_per_file
-            estimated_batches = max(1, estimated_total // self.settings.batch_size)
+        # =========================================
+        # PHASE 1: Read and chunk all files
+        # =========================================
+        chunks_to_embed: list[dict] = []
+        skipped_chunks = 0
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console
-            ) as progress:
-                file_task = progress.add_task(
-                    f"Processing files (0/{len(md_files)})...",
-                    total=len(md_files)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,  # Keep visible after completion
+        ) as progress:
+
+            read_task = progress.add_task(
+                "[cyan]Reading files",
+                total=len(md_files)
+            )
+
+            for md_file in md_files:
+                # Read file
+                try:
+                    content = md_file.read_text(encoding='utf-8')
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Could not read {md_file}: {e}[/yellow]")
+                    progress.advance(read_task)
+                    continue
+
+                # Chunk the file
+                file_chunks = chunk_markdown(
+                    content,
+                    self.settings.chunk_size,
+                    self.settings.chunk_overlap
                 )
 
-                for file_idx, md_file in enumerate(md_files):
-                    # Check for interruption
-                    if self._interrupted:
-                        console.print("[yellow]Stopping after current batch...[/yellow]")
-                        break
+                # Prepare chunks with metadata
+                relative_path = md_file.relative_to(source_path)
 
-                    progress.update(
-                        file_task,
-                        description=f"Processing files ({file_idx + 1}/{len(md_files)}): {md_file.name}"
-                    )
+                for idx, chunk_text in enumerate(file_chunks):
+                    content_hash = compute_content_hash(chunk_text)
 
-                    # Read file
-                    try:
-                        content = md_file.read_text(encoding='utf-8')
-                    except Exception as e:
-                        console.print(f"[yellow]Warning: Could not read {md_file}: {e}[/yellow]")
-                        progress.advance(file_task)
+                    # Check if already exists (idempotency)
+                    if self.vector_storage.chunk_exists(content_hash):
+                        skipped_chunks += 1
                         continue
 
-                    # Chunk the file
-                    file_chunks = chunk_markdown(
-                        content,
-                        self.settings.chunk_size,
-                        self.settings.chunk_overlap
-                    )
+                    chunks_to_embed.append({
+                        "text": chunk_text,
+                        "source_name": source_name,
+                        "file_path": str(relative_path),
+                        "chunk_index": idx,
+                        "embedding_model": self.embedder.model_name,
+                        "content_hash": content_hash
+                    })
 
-                    # Prepare chunks with metadata
-                    relative_path = md_file.relative_to(source_path)
+                progress.advance(read_task)
 
-                    for idx, chunk_text in enumerate(file_chunks):
-                        content_hash = compute_content_hash(chunk_text)
+        # Check if anything to embed
+        total_chunks_found = skipped_chunks + len(chunks_to_embed)
 
-                        # Check if already exists (idempotency)
-                        if self.vector_storage.chunk_exists(content_hash):
-                            skipped_chunks += 1
-                            continue
-
-                        # Add to current batch
-                        current_batch.append({
-                            "text": chunk_text,
-                            "source_name": source_name,
-                            "file_path": str(relative_path),
-                            "chunk_index": idx,
-                            "embedding_model": self.embedder.model_name,
-                            "content_hash": content_hash
-                        })
-
-                        # Process batch if full
-                        if len(current_batch) >= self.settings.batch_size:
-                            batch_num += 1
-                            # Update estimate based on actual progress
-                            actual_batches = max(estimated_batches, batch_num + 1)
-
-                            total_chunks_indexed += self._process_batch(
-                                current_batch,
-                                batch_num,
-                                actual_batches
-                            )
-                            current_batch = []  # Clear batch
-
-                            # Check for interruption after batch
-                            if self._interrupted:
-                                break
-
-                    progress.advance(file_task)
-
-            # Process remaining chunks in final batch
-            if current_batch and not self._interrupted:
-                batch_num += 1
-                total_chunks_indexed += self._process_batch(
-                    current_batch,
-                    batch_num,
-                    batch_num  # This is the last batch
-                )
-
-            # Update source as indexed
+        if not chunks_to_embed:
+            # Handle ghost source warning or normal re-index
+            self._print_summary(
+                source_name=source_name,
+                is_first_index=is_first_index,
+                skipped_chunks=skipped_chunks,
+                total_indexed=0,
+                total_batches=0,
+                total_found=total_chunks_found
+            )
             self.source_storage.update_indexed(source_name, self.embedder.model_name)
+            return 0
 
-            # Summary
-            console.print()
+        # =========================================
+        # PHASE 2: Embed and insert in batches
+        # =========================================
+        total_chunks = len(chunks_to_embed)
+        total_batches = (total_chunks + self.settings.batch_size - 1) // self.settings.batch_size
+        total_indexed = 0
+        batch_num = 0
 
-            # Calculate totals
-            total_chunks_found = skipped_chunks + total_chunks_indexed
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
 
-            # Detect "ghost source" situation (first index, all chunks skipped)
-            if is_first_index and skipped_chunks > 0 and total_chunks_indexed == 0:
-                console.print(f"[yellow]⚠️  Warning: All {skipped_chunks} chunks already exist in other sources.[/yellow]")
-                console.print(f"[yellow]   Source '{source_name}' has no unique content to search.[/yellow]")
-                console.print()
-                console.print("[dim]   This may happen when:[/dim]")
-                console.print("[dim]   - The same directory is indexed under different names[/dim]")
-                console.print("[dim]   - Subdirectories overlap with existing sources[/dim]")
-                console.print()
-                console.print("[dim]   Consider:[/dim]")
-                console.print(f"[dim]   - Remove this source: c42 remove {source_name}[/dim]")
-                console.print("[dim]   - Or adjust priority of existing source with same content[/dim]")
-                console.print()
-            elif skipped_chunks > 0 and total_chunks_indexed > 0:
-                # Some new, some existing - normal situation
-                console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
-            elif skipped_chunks > 0 and not is_first_index:
-                # Re-indexing normal - everything already exists
-                console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
+            embed_task = progress.add_task(
+                "[cyan]Embedding chunks",
+                total=total_chunks
+            )
 
-            # Final message
-            if total_chunks_indexed > 0:
-                console.print(f"[green]✓ Indexed {total_chunks_indexed} chunks in {batch_num} batch(es)[/green]")
-                if self._interrupted:
-                    console.print("[yellow](Partial indexing - run again to continue)[/yellow]")
-            elif total_chunks_found == 0:
-                console.print("[yellow]No chunks found to index (no markdown files or empty files)[/yellow]")
-            elif is_first_index and total_chunks_indexed == 0:
-                # Ghost source - warning already shown above
-                console.print(f"[yellow]✓ Indexing complete: 0 chunks created[/yellow]")
-            else:
-                # Re-index normal
-                console.print(f"[green]✓ All chunks already indexed (idempotent)[/green]")
+            # Process in batches
+            for i in range(0, total_chunks, self.settings.batch_size):
+                batch = chunks_to_embed[i:i + self.settings.batch_size]
+                batch_num += 1
 
-            return total_chunks_indexed
+                # Generate embeddings
+                texts = [chunk["text"] for chunk in batch]
+                embeddings = self.embedder.embed(texts)
 
-        finally:
-            # Restore original signal handler
-            signal.signal(signal.SIGINT, original_handler)
+                # Add vectors to chunks
+                for chunk, embedding in zip(batch, embeddings):
+                    chunk["vector"] = embedding.tolist()
+
+                # Insert to LanceDB
+                self.vector_storage.add_chunks(batch)
+
+                total_indexed += len(batch)
+                progress.advance(embed_task, advance=len(batch))
+
+        # Update source as indexed
+        self.source_storage.update_indexed(source_name, self.embedder.model_name)
+
+        # Print summary
+        self._print_summary(
+            source_name=source_name,
+            is_first_index=is_first_index,
+            skipped_chunks=skipped_chunks,
+            total_indexed=total_indexed,
+            total_batches=batch_num,
+            total_found=total_chunks_found
+        )
+
+        return total_indexed
