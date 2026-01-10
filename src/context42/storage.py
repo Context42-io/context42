@@ -134,6 +134,35 @@ class SourceStorage:
             )
         return None
 
+    def get_source_by_path(self, path: str) -> Optional[Source]:
+        """
+        Get source by path.
+
+        Args:
+            path: Path to search (will be normalized)
+
+        Returns:
+            Source if found, None otherwise
+        """
+        # Normalize path for consistent comparison
+        normalized_path = str(Path(path).expanduser().resolve())
+
+        cursor = self.conn.execute(
+            "SELECT name, path, indexed_at, embedding_model, priority "
+            "FROM sources WHERE path = ?",
+            (normalized_path,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return Source(
+                name=row["name"],
+                path=row["path"],
+                indexed_at=row["indexed_at"],
+                embedding_model=row["embedding_model"],
+                priority=row["priority"] if "priority" in row.keys() else 1.0
+            )
+        return None
+
     def update_indexed(self, name: str, embedding_model: str) -> None:
         """
         Mark source as indexed with timestamp and model.

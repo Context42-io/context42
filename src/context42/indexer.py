@@ -498,6 +498,9 @@ class Indexer:
             if not source:
                 raise ValueError(f"Source '{source_name}' not found")
 
+            # Check if this is first indexing (for ghost source detection)
+            is_first_index = source.indexed_at is None
+
             # Check model compatibility
             self.check_model_compatibility(source_name)
 
@@ -617,15 +620,43 @@ class Indexer:
 
             # Summary
             console.print()
-            if skipped_chunks > 0:
+
+            # Calculate totals
+            total_chunks_found = skipped_chunks + total_chunks_indexed
+
+            # Detect "ghost source" situation (first index, all chunks skipped)
+            if is_first_index and skipped_chunks > 0 and total_chunks_indexed == 0:
+                console.print(f"[yellow]⚠️  Warning: All {skipped_chunks} chunks already exist in other sources.[/yellow]")
+                console.print(f"[yellow]   Source '{source_name}' has no unique content to search.[/yellow]")
+                console.print()
+                console.print("[dim]   This may happen when:[/dim]")
+                console.print("[dim]   - The same directory is indexed under different names[/dim]")
+                console.print("[dim]   - Subdirectories overlap with existing sources[/dim]")
+                console.print()
+                console.print("[dim]   Consider:[/dim]")
+                console.print(f"[dim]   - Remove this source: c42 remove {source_name}[/dim]")
+                console.print("[dim]   - Or adjust priority of existing source with same content[/dim]")
+                console.print()
+            elif skipped_chunks > 0 and total_chunks_indexed > 0:
+                # Some new, some existing - normal situation
+                console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
+            elif skipped_chunks > 0 and not is_first_index:
+                # Re-indexing normal - everything already exists
                 console.print(f"[dim]Skipped {skipped_chunks} already indexed chunks[/dim]")
 
+            # Final message
             if total_chunks_indexed > 0:
                 console.print(f"[green]✓ Indexed {total_chunks_indexed} chunks in {batch_num} batch(es)[/green]")
                 if self._interrupted:
                     console.print("[yellow](Partial indexing - run again to continue)[/yellow]")
+            elif total_chunks_found == 0:
+                console.print("[yellow]No chunks found to index (no markdown files or empty files)[/yellow]")
+            elif is_first_index and total_chunks_indexed == 0:
+                # Ghost source - warning already shown above
+                console.print(f"[yellow]✓ Indexing complete: 0 chunks created[/yellow]")
             else:
-                console.print("[green]✓ All chunks already indexed (idempotent)[/green]")
+                # Re-index normal
+                console.print(f"[green]✓ All chunks already indexed (idempotent)[/green]")
 
             return total_chunks_indexed
 

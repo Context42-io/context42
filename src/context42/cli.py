@@ -96,6 +96,16 @@ def add(
         console.print(f"[yellow]Existing path: {existing.path}[/yellow]")
         raise typer.Exit(1)
 
+    # Check if path already indexed by another source
+    existing_source = storage.get_source_by_path(str(source_path))
+    if existing_source:
+        console.print(f"[red]Error: Path '{source_path}' is already indexed by source '{existing_source.name}'.[/red]")
+        console.print()
+        console.print("[dim]Consider:[/dim]")
+        console.print(f"[dim]  - Change priority: c42 set-priority {existing_source.name} <value>[/dim]")
+        console.print(f"[dim]  - Remove existing: c42 remove {existing_source.name}[/dim]")
+        raise typer.Exit(1)
+
     # Add source
     try:
         storage.add_source(name, str(source_path), priority)
