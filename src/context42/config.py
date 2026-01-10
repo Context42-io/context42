@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 50
 
+    # Batch processing
+    batch_size: int = 50  # Chunks per batch for embedding/insert
+
     # Search
     default_top_k: int = 5
 
