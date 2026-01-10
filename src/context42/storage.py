@@ -17,6 +17,7 @@ class Source:
     path: str
     indexed_at: Optional[str]
     embedding_model: Optional[str]
+    priority: float = 1.0
 
 
 class SourceStorage:
@@ -50,42 +51,65 @@ class SourceStorage:
                 name TEXT PRIMARY KEY,
                 path TEXT NOT NULL,
                 indexed_at TEXT,
-                embedding_model TEXT
+                embedding_model TEXT,
+                priority REAL DEFAULT 1.0
             )
         """)
         self.conn.commit()
 
-    def add_source(self, name: str, path: str) -> None:
+        # Migrate existing databases
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        """
+        Migrate existing databases to add priority column.
+
+        This ensures backward compatibility with databases created before v0.3.0.
+        """
+        cursor = self.conn.execute("PRAGMA table_info(sources)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "priority" not in columns:
+            self.conn.execute("ALTER TABLE sources ADD COLUMN priority REAL DEFAULT 1.0")
+            self.conn.commit()
+
+    def add_source(self, name: str, path: str, priority: float = 1.0) -> None:
         """
         Add a new source.
 
         Args:
             name: Unique source name
             path: Path to source directory
+            priority: Priority for search results (0.1-1.0, default: 1.0)
 
         Raises:
             sqlite3.IntegrityError: If source name already exists
+            ValueError: If priority is out of range
         """
+        if not 0.1 <= priority <= 1.0:
+            raise ValueError(f"Priority must be between 0.1 and 1.0, got {priority}")
+
         self.conn.execute(
-            "INSERT INTO sources (name, path, indexed_at, embedding_model) VALUES (?, ?, NULL, NULL)",
-            (name, path)
+            "INSERT INTO sources (name, path, indexed_at, embedding_model, priority) VALUES (?, ?, NULL, NULL, ?)",
+            (name, path, priority)
         )
         self.conn.commit()
 
     def list_sources(self) -> list[Source]:
         """
-        List all sources.
+        List all sources ordered by priority (highest first).
 
         Returns:
             List of Source objects
         """
-        cursor = self.conn.execute("SELECT * FROM sources ORDER BY name")
+        cursor = self.conn.execute("SELECT * FROM sources ORDER BY priority DESC, name")
         rows = cursor.fetchall()
         return [Source(
             name=row["name"],
             path=row["path"],
             indexed_at=row["indexed_at"],
-            embedding_model=row["embedding_model"]
+            embedding_model=row["embedding_model"],
+            priority=row["priority"] if "priority" in row.keys() else 1.0  # Backwards compatibility
         ) for row in rows]
 
     def get_source(self, name: str) -> Optional[Source]:
@@ -105,7 +129,8 @@ class SourceStorage:
                 name=row["name"],
                 path=row["path"],
                 indexed_at=row["indexed_at"],
-                embedding_model=row["embedding_model"]
+                embedding_model=row["embedding_model"],
+                priority=row["priority"] if "priority" in row.keys() else 1.0  # Backwards compatibility
             )
         return None
 
@@ -137,6 +162,46 @@ class SourceStorage:
         cursor = self.conn.execute("DELETE FROM sources WHERE name = ?", (name,))
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def set_priority(self, name: str, priority: float) -> bool:
+        """
+        Update priority for an existing source.
+
+        Args:
+            name: Source name
+            priority: New priority value (0.1-1.0)
+
+        Returns:
+            True if updated, False if source didn't exist
+
+        Raises:
+            ValueError: If priority is out of range
+        """
+        if not 0.1 <= priority <= 1.0:
+            raise ValueError(f"Priority must be between 0.1 and 1.0, got {priority}")
+
+        cursor = self.conn.execute(
+            "UPDATE sources SET priority = ? WHERE name = ?",
+            (priority, name)
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_source_priority(self, name: str) -> Optional[float]:
+        """
+        Get priority for a source.
+
+        Args:
+            name: Source name
+
+        Returns:
+            Priority value or None if source not found
+        """
+        cursor = self.conn.execute("SELECT priority FROM sources WHERE name = ?", (name,))
+        row = cursor.fetchone()
+        if row:
+            return row["priority"] if "priority" in row.keys() else 1.0
+        return None
 
     def close(self) -> None:
         """Close database connection."""

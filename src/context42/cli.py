@@ -66,9 +66,15 @@ def main(
 @handle_errors
 def add(
     path: str = typer.Argument(..., help="Path to source directory"),
-    name: str = typer.Option(..., "--name", "-n", help="Unique source name")
+    name: str = typer.Option(..., "--name", "-n", help="Unique source name"),
+    priority: Annotated[float, typer.Option("--priority", "-p", help="Priority for search results (0.1-1.0, default: 1.0)")] = 1.0,
 ):
     """Add a source directory containing markdown files."""
+    # Validate priority
+    if not 0.1 <= priority <= 1.0:
+        console.print(f"[red]Error: Priority must be between 0.1 and 1.0, got {priority}[/red]")
+        raise typer.Exit(1)
+
     # Validate path exists
     source_path = Path(path).expanduser().resolve()
     if not source_path.exists():
@@ -92,9 +98,10 @@ def add(
 
     # Add source
     try:
-        storage.add_source(name, str(source_path))
+        storage.add_source(name, str(source_path), priority)
         console.print(f"[green]✓ Source '{name}' added successfully[/green]")
         console.print(f"[blue]Path: {source_path}[/blue]")
+        console.print(f"[blue]Priority: {priority}[/blue]")
         console.print("\n[yellow]Next: Run 'c42 index' to index this source[/yellow]")
     except sqlite3.IntegrityError:
         console.print(f"[red]Error: Source '{name}' already exists[/red]")
@@ -123,16 +130,19 @@ def list():
         table = Table(title="Sources")
         table.add_column("Name", style="cyan", no_wrap=True)
         table.add_column("Path", style="blue")
+        table.add_column("Priority", style="yellow", justify="right")
         table.add_column("Indexed", style="green")
         table.add_column("Model", style="magenta")
 
         for source in sources:
             indexed_status = source.indexed_at if source.indexed_at else "[yellow]pending[/yellow]"
             model_display = source.embedding_model if source.embedding_model else "-"
+            priority_display = f"{source.priority:.1f}"
 
             table.add_row(
                 source.name,
                 source.path,
+                priority_display,
                 indexed_status,
                 model_display
             )
@@ -192,6 +202,43 @@ def remove(
 
     finally:
         source_storage.close()
+
+
+@app.command()
+@handle_errors
+def set_priority(
+    name: Annotated[str, typer.Argument(help="Name of the source")],
+    priority: Annotated[float, typer.Argument(help="New priority value (0.1-1.0)")],
+):
+    """Update priority for an existing source."""
+    # Validate priority
+    if not 0.1 <= priority <= 1.0:
+        console.print(f"[red]Error: Priority must be between 0.1 and 1.0, got {priority}[/red]")
+        raise typer.Exit(1)
+
+    settings.ensure_dirs()
+    storage = SourceStorage(settings.db_path)
+
+    try:
+        # Check if source exists
+        source = storage.get_source(name)
+        if not source:
+            console.print(f"[red]Error: Source '{name}' not found.[/red]")
+            console.print("\nAvailable sources:")
+            sources = storage.list_sources()
+            for s in sources:
+                console.print(f"  - {s.name}")
+            raise typer.Exit(1)
+
+        # Update priority
+        old_priority = source.priority
+        storage.set_priority(name, priority)
+        console.print(f"[green]✓ Priority updated for '{name}'[/green]")
+        console.print(f"[blue]Old priority: {old_priority}[/blue]")
+        console.print(f"[blue]New priority: {priority}[/blue]")
+
+    finally:
+        storage.close()
 
 
 @app.command()
@@ -281,7 +328,7 @@ def search(
         vector_storage = VectorStorage(settings.vectors_path)
         vector_storage.init_db()
         embedder = Embedder(settings.embedding_model)
-        engine = SearchEngine(vector_storage, embedder)
+        engine = SearchEngine(vector_storage, embedder, source_storage)
 
         # Execute search
         console.print(f"[dim]Searching for: {query}[/dim]\n")
@@ -298,11 +345,15 @@ def search(
 
         # Display results
         for i, r in enumerate(results, 1):
+            # Priority indicator
+            priority_indicator = "⭐ " if r.is_priority else "  "
+
             # Color score based on value
             score_color = "green" if r.score >= 0.8 else "yellow" if r.score >= 0.6 else "red"
-            console.print(f"[bold]#{i}[/bold] [{score_color}]Score: {r.score:.4f}[/{score_color}]")
-            console.print(f"    [cyan]Source:[/cyan] {r.source_name}")
-            console.print(f"    [cyan]File:[/cyan]   {r.file_path}")
+            console.print(f"[bold]#{i}[/bold] {priority_indicator}[{score_color}]Score: {r.score:.4f}[/{score_color}]")
+            console.print(f"    [cyan]Source:[/cyan]   {r.source_name}")
+            console.print(f"    [cyan]File:[/cyan]     {r.file_path}")
+            console.print(f"    [cyan]Priority:[/cyan] {r.priority:.1f} [dim](weighted: {r.weighted_score:.4f})[/dim]")
 
             # Truncated text preview
             text_preview = r.text[:200].replace("\n", " ")

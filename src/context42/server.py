@@ -36,8 +36,8 @@ def get_search_engine() -> SearchEngine:
         # Initialize embedder
         embedder = Embedder(settings.embedding_model)
 
-        # Create search engine
-        _search_engine = SearchEngine(vector_storage, embedder)
+        # Create search engine with source_storage for priority lookup
+        _search_engine = SearchEngine(vector_storage, embedder, source_storage)
 
     return _search_engine
 
@@ -45,22 +45,26 @@ def get_search_engine() -> SearchEngine:
 @mcp.tool()
 def search(query: str, top_k: int = 5) -> list[dict]:
     """
-    Search personal coding instructions using vector similarity.
+    Search personal coding instructions using vector similarity with priority weighting.
 
     This tool searches through your indexed coding instructions, guidelines,
     and documentation to find relevant information based on semantic similarity.
+    Results are ordered by priority-weighted scores to prioritize personal
+    instructions over reference documentation.
 
     Args:
         query: The search query (e.g., "how to handle errors in Python")
         top_k: Maximum number of results to return (default: 5, max: 20)
 
     Returns:
-        List of relevant text chunks with similarity scores, sorted by relevance.
+        List of relevant text chunks with similarity scores, sorted by priority-weighted relevance.
         Each result contains:
         - text: The content of the chunk
         - source: Name of the source this came from
         - file: Relative path to the file
         - score: Similarity score (0-1, higher is more relevant)
+        - priority: Priority of the source (0.1-1.0, higher means more important)
+        - is_priority: True if this is a priority source (priority >= 0.8)
     """
     # Validate top_k
     if top_k < 1:
@@ -81,6 +85,8 @@ def search(query: str, top_k: int = 5) -> list[dict]:
             "source": r.source_name,
             "file": r.file_path,
             "score": round(r.score, 4),
+            "priority": round(r.priority, 1),
+            "is_priority": r.is_priority,
         }
         for r in results
     ]
