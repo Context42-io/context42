@@ -298,7 +298,8 @@ class VectorStorage:
     def init_db(self) -> None:
         """Create or open chunks table."""
         # Check if table exists
-        table_names = self.db.table_names()
+        tables_response = self.db.list_tables()
+        table_names = tables_response.tables
 
         if self.table_name in table_names:
             self.table = self.db.open_table(self.table_name)
@@ -434,9 +435,16 @@ class VectorStorage:
         # Total chunks
         total = self.table.count_rows()
 
-        # Count per source - convert to pandas and group
-        df = self.table.to_pandas()
-        sources = df.groupby("source_name").size().to_dict() if not df.empty else {}
+        # Count per source using PyArrow (no pandas needed)
+        sources: dict[str, int] = {}
+        if total > 0:
+            arrow_table = self.table.to_arrow()
+            source_column = arrow_table["source_name"]
+
+            # Count occurrences of each source
+            for source_name in source_column:
+                name = source_name.as_py()
+                sources[name] = sources.get(name, 0) + 1
 
         # Storage size - sum all files in vectors directory
         size = sum(

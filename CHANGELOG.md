@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-01-11
+
+### Fixed
+- Fixed `c42 status` showing 0 chunks due to undeclared pandas dependency
+- Fixed `-v/--verbose` flag not showing errors (silent exception handling)
+- Fixed LanceDB deprecation warning (`table_names()` → `list_tables()`)
+
+### Changed
+- Rewrote `get_stats()` to use PyArrow instead of pandas (lighter, no extra dependency)
+- Added proper `logger.debug()` calls for verbose mode support
+- Updated `init_db()` to use `list_tables()` API and access `.tables` attribute
+
+### Removed
+- Removed implicit pandas dependency (~12MB smaller installation)
+
 ## [0.4.0] - 2026-01-11
 
 ### Added

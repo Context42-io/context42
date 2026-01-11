@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Annotated, Optional
 from functools import wraps
+import logging
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -12,6 +13,8 @@ from .config import settings
 from .storage import SourceStorage, VectorStorage
 from .indexer import Embedder, Indexer
 
+
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(
     name="context42",
@@ -36,6 +39,7 @@ def handle_errors(func):
             console.print(f"[red]Error: Permission denied - {e.filename}[/red]")
             raise typer.Exit(1)
         except Exception as e:
+            logger.debug(f"Unhandled exception: {e}", exc_info=True)
             console.print(f"[red]Error: {e}[/red]")
             console.print("[dim]Run with --verbose for details.[/dim]")
             raise typer.Exit(1)
@@ -298,7 +302,9 @@ def status():
 
         try:
             stats = vector_storage.get_stats()
-        except Exception:
+        except Exception as e:
+            # Log error in verbose mode (-v)
+            logger.debug(f"Failed to get vector stats: {e}", exc_info=True)
             # Table might not exist yet
             stats = {"total_chunks": 0, "sources": {}, "storage_size_bytes": 0}
 
