@@ -18,6 +18,7 @@ class Source:
     indexed_at: Optional[str]
     embedding_model: Optional[str]
     priority: float = 1.0
+    excludes: Optional[str] = None  # JSON string of patterns
 
 
 class SourceStorage:
@@ -52,7 +53,8 @@ class SourceStorage:
                 path TEXT NOT NULL,
                 indexed_at TEXT,
                 embedding_model TEXT,
-                priority REAL DEFAULT 1.0
+                priority REAL DEFAULT 1.0,
+                excludes TEXT
             )
         """)
         self.conn.commit()
@@ -62,9 +64,11 @@ class SourceStorage:
 
     def _migrate_schema(self) -> None:
         """
-        Migrate existing databases to add priority column.
+        Migrate existing databases to add new columns.
 
-        This ensures backward compatibility with databases created before v0.3.0.
+        This ensures backward compatibility with databases created before:
+        - v0.3.0 (priority column)
+        - v0.4.0 (excludes column)
         """
         cursor = self.conn.execute("PRAGMA table_info(sources)")
         columns = [row[1] for row in cursor.fetchall()]
@@ -73,7 +77,17 @@ class SourceStorage:
             self.conn.execute("ALTER TABLE sources ADD COLUMN priority REAL DEFAULT 1.0")
             self.conn.commit()
 
-    def add_source(self, name: str, path: str, priority: float = 1.0) -> None:
+        if "excludes" not in columns:
+            self.conn.execute("ALTER TABLE sources ADD COLUMN excludes TEXT")
+            self.conn.commit()
+
+    def add_source(
+        self,
+        name: str,
+        path: str,
+        priority: float = 1.0,
+        excludes: Optional[list[str]] = None
+    ) -> None:
         """
         Add a new source.
 
@@ -81,17 +95,23 @@ class SourceStorage:
             name: Unique source name
             path: Path to source directory
             priority: Priority for search results (0.1-1.0, default: 1.0)
+            excludes: Additional exclude patterns (beyond defaults)
 
         Raises:
             sqlite3.IntegrityError: If source name already exists
             ValueError: If priority is out of range
         """
+        import json
+
         if not 0.1 <= priority <= 1.0:
             raise ValueError(f"Priority must be between 0.1 and 1.0, got {priority}")
 
+        excludes_json = json.dumps(excludes) if excludes else None
+
         self.conn.execute(
-            "INSERT INTO sources (name, path, indexed_at, embedding_model, priority) VALUES (?, ?, NULL, NULL, ?)",
-            (name, path, priority)
+            "INSERT INTO sources (name, path, indexed_at, embedding_model, priority, excludes) "
+            "VALUES (?, ?, NULL, NULL, ?, ?)",
+            (name, path, priority, excludes_json)
         )
         self.conn.commit()
 
@@ -109,7 +129,8 @@ class SourceStorage:
             path=row["path"],
             indexed_at=row["indexed_at"],
             embedding_model=row["embedding_model"],
-            priority=row["priority"] if "priority" in row.keys() else 1.0  # Backwards compatibility
+            priority=row["priority"] if "priority" in row.keys() else 1.0,  # Backwards compatibility
+            excludes=row["excludes"] if "excludes" in row.keys() else None
         ) for row in rows]
 
     def get_source(self, name: str) -> Optional[Source]:
@@ -130,7 +151,8 @@ class SourceStorage:
                 path=row["path"],
                 indexed_at=row["indexed_at"],
                 embedding_model=row["embedding_model"],
-                priority=row["priority"] if "priority" in row.keys() else 1.0  # Backwards compatibility
+                priority=row["priority"] if "priority" in row.keys() else 1.0,  # Backwards compatibility
+                excludes=row["excludes"] if "excludes" in row.keys() else None
             )
         return None
 
@@ -148,7 +170,7 @@ class SourceStorage:
         normalized_path = str(Path(path).expanduser().resolve())
 
         cursor = self.conn.execute(
-            "SELECT name, path, indexed_at, embedding_model, priority "
+            "SELECT name, path, indexed_at, embedding_model, priority, excludes "
             "FROM sources WHERE path = ?",
             (normalized_path,)
         )
@@ -159,7 +181,8 @@ class SourceStorage:
                 path=row["path"],
                 indexed_at=row["indexed_at"],
                 embedding_model=row["embedding_model"],
-                priority=row["priority"] if "priority" in row.keys() else 1.0
+                priority=row["priority"] if "priority" in row.keys() else 1.0,
+                excludes=row["excludes"] if "excludes" in row.keys() else None
             )
         return None
 
@@ -231,6 +254,23 @@ class SourceStorage:
         if row:
             return row["priority"] if "priority" in row.keys() else 1.0
         return None
+
+    def get_source_excludes(self, name: str) -> list[str]:
+        """
+        Get exclude patterns for a source.
+
+        Args:
+            name: Source name
+
+        Returns:
+            List of additional exclude patterns (empty if none)
+        """
+        import json
+
+        source = self.get_source(name)
+        if source and source.excludes:
+            return json.loads(source.excludes)
+        return []
 
     def close(self) -> None:
         """Close database connection."""

@@ -68,8 +68,10 @@ def add(
     path: str = typer.Argument(..., help="Path to source directory"),
     name: str = typer.Option(..., "--name", "-n", help="Unique source name"),
     priority: Annotated[float, typer.Option("--priority", "-p", help="Priority for search results (0.1-1.0, default: 1.0)")] = 1.0,
+    exclude: Annotated[Optional[list[str]], typer.Option("--exclude", "-e", help="Additional patterns to exclude (can be used multiple times)")] = None,
+    no_default_excludes: Annotated[bool, typer.Option("--no-default-excludes", help="Don't use default exclude patterns")] = False,
 ):
-    """Add a source directory containing markdown files."""
+    """Add a source directory containing markdown or RST files."""
     # Validate priority
     if not 0.1 <= priority <= 1.0:
         console.print(f"[red]Error: Priority must be between 0.1 and 1.0, got {priority}[/red]")
@@ -106,12 +108,37 @@ def add(
         console.print(f"[dim]  - Remove existing: c42 remove {existing_source.name}[/dim]")
         raise typer.Exit(1)
 
+    # Build excludes list
+    custom_excludes = exclude if exclude else []
+
+    # Store whether to use defaults (we'll handle this in indexer)
+    # If no_default_excludes, we store a marker to indicate no defaults
+    if no_default_excludes:
+        # Store marker to indicate no defaults
+        custom_excludes.insert(0, "__NO_DEFAULTS__")
+
     # Add source
     try:
-        storage.add_source(name, str(source_path), priority)
+        storage.add_source(
+            name=name,
+            path=str(source_path),
+            priority=priority,
+            excludes=custom_excludes if custom_excludes else None
+        )
         console.print(f"[green]✓ Source '{name}' added successfully[/green]")
         console.print(f"[blue]Path: {source_path}[/blue]")
         console.print(f"[blue]Priority: {priority}[/blue]")
+
+        # Show exclude info
+        if custom_excludes:
+            display_excludes = [e for e in custom_excludes if e != "__NO_DEFAULTS__"]
+            if display_excludes:
+                console.print(f"[blue]Custom excludes: {', '.join(display_excludes)}[/blue]")
+            if no_default_excludes:
+                console.print("[yellow]⚠ Default excludes disabled[/yellow]")
+        else:
+            console.print("[dim]Using default exclude patterns[/dim]")
+
         console.print("\n[yellow]Next: Run 'c42 index' to index this source[/yellow]")
     except sqlite3.IntegrityError:
         console.print(f"[red]Error: Source '{name}' already exists[/red]")

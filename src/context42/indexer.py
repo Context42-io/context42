@@ -2,6 +2,8 @@
 
 import hashlib
 import re
+import fnmatch
+import json
 from pathlib import Path
 from typing import Optional
 from rich.console import Console
@@ -17,7 +19,7 @@ from rich.progress import (
 from fastembed import TextEmbedding
 
 from .storage import SourceStorage, VectorStorage
-from .config import Settings
+from .config import Settings, DEFAULT_EXCLUDES, SUPPORTED_EXTENSIONS
 
 
 console = Console()
@@ -34,6 +36,73 @@ def compute_content_hash(text: str) -> str:
         Hex digest of SHA256 hash
     """
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def should_exclude(file_path: Path, source_path: Path, excludes: list[str]) -> bool:
+    """
+    Check if a file should be excluded from indexing.
+
+    Args:
+        file_path: Absolute path to file
+        source_path: Root source directory
+        excludes: List of exclude patterns
+
+    Returns:
+        True if file should be excluded
+    """
+    # Get relative path for pattern matching
+    try:
+        relative = file_path.relative_to(source_path)
+    except ValueError:
+        return False
+
+    relative_str = str(relative)
+
+    # Check each pattern
+    for pattern in excludes:
+        # Check if any part of the path matches
+        parts = relative.parts
+
+        for part in parts:
+            # Direct match
+            if fnmatch.fnmatch(part, pattern):
+                return True
+
+        # Full path match
+        if fnmatch.fnmatch(relative_str, pattern):
+            return True
+
+        # Pattern with path separator
+        if fnmatch.fnmatch(relative_str, f"*/{pattern}"):
+            return True
+        if fnmatch.fnmatch(relative_str, f"{pattern}/*"):
+            return True
+        if fnmatch.fnmatch(relative_str, f"*/{pattern}/*"):
+            return True
+
+    return False
+
+
+def get_effective_excludes(source_excludes: Optional[str]) -> list[str]:
+    """
+    Get effective exclude patterns combining defaults and custom.
+
+    Args:
+        source_excludes: JSON string of custom excludes (may contain __NO_DEFAULTS__ marker)
+
+    Returns:
+        List of patterns to exclude
+    """
+    custom = json.loads(source_excludes) if source_excludes else []
+
+    # Check for no-defaults marker
+    use_defaults = "__NO_DEFAULTS__" not in custom
+    custom = [e for e in custom if e != "__NO_DEFAULTS__"]
+
+    if use_defaults:
+        return list(DEFAULT_EXCLUDES) + custom
+    else:
+        return custom
 
 
 def chunk_markdown(text: str, chunk_size: int = 500, overlap: int = 50, min_chunk_size: int = 100) -> list[str]:
@@ -335,6 +404,236 @@ def _split_sentences(text: str) -> list[str]:
     return [s for s in sentences if s.strip()]
 
 
+def _parse_rst_sections(text: str) -> list[tuple[str, str]]:
+    """
+    Parse RST into (header, content) pairs.
+
+    RST uses underlines (and optional overlines) for headers:
+    - Characters: = - ` : . ' " ~ ^ _ * + #
+    - First style encountered becomes H1, second H2, etc.
+
+    Args:
+        text: RST text
+
+    Returns:
+        List of (header, content) tuples
+    """
+    lines = text.split('\n')
+    sections = []
+
+    # RST header underline characters
+    header_chars = set('=-`:\'.\"~^_*+#')
+
+    # Track header hierarchy (first seen = H1, etc)
+    seen_styles: list[str] = []
+
+    current_header = ""
+    current_content_lines = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Check for header pattern
+        is_header = False
+        header_text = ""
+        style = ""
+
+        # Pattern 1: Overline + Title + Underline (e.g., === Title ===)
+        if (i + 2 < len(lines) and
+            len(line) >= 3 and
+            line[0] in header_chars and
+            len(set(line.strip())) == 1):
+
+            title_line = lines[i + 1]
+            underline = lines[i + 2] if i + 2 < len(lines) else ""
+
+            if (len(underline) >= 3 and
+                underline[0] == line[0] and
+                len(set(underline.strip())) == 1 and
+                len(title_line.strip()) > 0):
+
+                is_header = True
+                header_text = title_line.strip()
+                style = line[0] + "_overline"
+
+                if style not in seen_styles:
+                    seen_styles.append(style)
+
+                i += 3
+
+        # Pattern 2: Title + Underline only
+        if not is_header and i + 1 < len(lines):
+            next_line = lines[i + 1]
+
+            if (len(line.strip()) > 0 and
+                len(next_line) >= 3 and
+                next_line[0] in header_chars and
+                len(set(next_line.strip())) == 1 and
+                len(next_line.strip()) >= len(line.strip())):
+
+                is_header = True
+                header_text = line.strip()
+                style = next_line[0]
+
+                if style not in seen_styles:
+                    seen_styles.append(style)
+
+                i += 2
+
+        if is_header:
+            # Save previous section
+            if current_header or current_content_lines:
+                content = '\n'.join(current_content_lines)
+                sections.append((current_header, content))
+
+            # Get header level based on order seen
+            level = seen_styles.index(style) + 1
+            header_prefix = "#" * min(level, 6)  # Convert to markdown-style for consistency
+
+            current_header = f"{header_prefix} {header_text}"
+            current_content_lines = []
+        else:
+            # Regular content line
+            current_content_lines.append(line)
+            i += 1
+
+    # Save last section
+    if current_header or current_content_lines:
+        content = '\n'.join(current_content_lines)
+        sections.append((current_header, content))
+
+    return sections
+
+
+def _clean_rst_content(content: str) -> str:
+    """
+    Clean RST-specific formatting for better embedding.
+
+    Args:
+        content: Raw RST content
+
+    Returns:
+        Cleaned content
+    """
+    lines = content.split('\n')
+    cleaned = []
+
+    in_code_block = False
+
+    for line in lines:
+        # Handle code blocks (.. code-block::)
+        if line.strip().startswith('.. code-block::'):
+            in_code_block = True
+            cleaned.append('')  # Blank line before code
+            cleaned.append('```')
+            continue
+
+        # Handle other directives (skip them)
+        if line.strip().startswith('.. '):
+            # Common directives to skip: note, warning, seealso, etc
+            if any(d in line for d in ['note::', 'warning::', 'seealso::', 'versionadded::',
+                                         'versionchanged::', 'deprecated::', 'todo::']):
+                continue
+
+        # End code block on dedent
+        if in_code_block and line and not line.startswith(' ') and not line.startswith('\t'):
+            cleaned.append('```')
+            cleaned.append('')
+            in_code_block = False
+
+        # Convert RST inline formatting to markdown-ish
+        line = line.replace('``', '`')  # Inline code
+        line = line.replace('::', ':')   # Literal blocks
+
+        cleaned.append(line)
+
+    # Close any open code block
+    if in_code_block:
+        cleaned.append('```')
+
+    return '\n'.join(cleaned)
+
+
+def chunk_rst(text: str, chunk_size: int = 500, overlap: int = 50, min_chunk_size: int = 100) -> list[str]:
+    """
+    Chunk RST text ensuring each chunk contains meaningful content.
+
+    Converts RST sections to a normalized format and applies same
+    chunking logic as markdown.
+
+    Args:
+        text: RST text to chunk
+        chunk_size: Target chunk size in characters
+        overlap: Overlap between chunks
+        min_chunk_size: Minimum content size for useful chunks
+
+    Returns:
+        List of text chunks
+    """
+    chunks = []
+
+    # Parse into (header, content) pairs
+    sections = _parse_rst_sections(text)
+
+    # Accumulator for small sections
+    accumulated_header = ""
+    accumulated_content = ""
+
+    for header, content in sections:
+        # Clean up RST-specific formatting
+        content = _clean_rst_content(content)
+
+        content_stripped = content.strip()
+        if not content_stripped:
+            continue
+
+        total_content = accumulated_content + "\n\n" + content_stripped if accumulated_content else content_stripped
+
+        if len(content_stripped) < min_chunk_size:
+            if not accumulated_header:
+                accumulated_header = header
+            accumulated_content = total_content
+            continue
+
+        # Process accumulated content
+        if accumulated_content:
+            full_accumulated = f"{accumulated_header}\n\n{accumulated_content}".strip()
+            if len(full_accumulated) > chunk_size:
+                chunks.extend(_split_large_section(accumulated_header, accumulated_content, chunk_size, overlap))
+            else:
+                chunks.append(full_accumulated)
+            accumulated_header = ""
+            accumulated_content = ""
+
+        # Process current section
+        full_section = f"{header}\n\n{content_stripped}".strip()
+        if len(full_section) > chunk_size:
+            chunks.extend(_split_large_section(header, content_stripped, chunk_size, overlap))
+        else:
+            chunks.append(full_section)
+
+    # Last accumulated
+    if accumulated_content:
+        full_accumulated = f"{accumulated_header}\n\n{accumulated_content}".strip()
+        chunks.append(full_accumulated)
+
+    # Final validation
+    final_chunks = []
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+
+        lines = chunk.strip().split('\n')
+        non_header_lines = [l for l in lines if l.strip() and not l.strip().startswith('#')]
+        non_header_content = '\n'.join(non_header_lines).strip()
+
+        if len(non_header_content) >= 20:
+            final_chunks.append(chunk)
+
+    return final_chunks
+
+
 class Embedder:
     """Embedding generator using fastembed (ONNX, offline)."""
 
@@ -509,16 +808,32 @@ class Indexer:
         console.print(f"\n[bold blue]Indexing source: {source_name}[/bold blue]")
         console.print(f"[dim]Path: {source.path}[/dim]")
 
-        # Find all .md files
+        # Get source path
         source_path = Path(source.path).expanduser()
         if not source_path.exists():
             raise ValueError(f"Source path does not exist: {source.path}")
 
-        md_files = list(source_path.rglob("*.md"))
-        console.print(f"[blue]Found {len(md_files)} markdown files[/blue]")
+        # Get effective excludes
+        excludes = get_effective_excludes(source.excludes)
 
-        if not md_files:
-            console.print("[yellow]No markdown files found[/yellow]")
+        # Find all supported files (.md, .rst)
+        all_files = []
+        for ext in SUPPORTED_EXTENSIONS:
+            all_files.extend(source_path.rglob(f"*{ext}"))
+
+        # Filter out excluded files
+        files_to_index = [
+            f for f in all_files
+            if not should_exclude(f, source_path, excludes)
+        ]
+
+        console.print(f"[blue]Found {len(files_to_index)} files to index[/blue]")
+        if len(all_files) > len(files_to_index):
+            excluded_count = len(all_files) - len(files_to_index)
+            console.print(f"[dim]Excluded {excluded_count} files by patterns[/dim]")
+
+        if not files_to_index:
+            console.print("[yellow]No files found to index[/yellow]")
             return 0
 
         # Pre-load embedding model (shows loading message before progress bars)
@@ -544,27 +859,36 @@ class Indexer:
 
             read_task = progress.add_task(
                 "[cyan]Reading files",
-                total=len(md_files)
+                total=len(files_to_index)
             )
 
-            for md_file in md_files:
+            for file_path in files_to_index:
                 # Read file
                 try:
-                    content = md_file.read_text(encoding='utf-8')
+                    content = file_path.read_text(encoding='utf-8')
                 except Exception as e:
-                    console.print(f"[yellow]Warning: Could not read {md_file}: {e}[/yellow]")
+                    console.print(f"[yellow]Warning: Could not read {file_path}: {e}[/yellow]")
                     progress.advance(read_task)
                     continue
 
-                # Chunk the file
-                file_chunks = chunk_markdown(
-                    content,
-                    self.settings.chunk_size,
-                    self.settings.chunk_overlap
-                )
+                # Choose chunker based on extension
+                if file_path.suffix.lower() == ".rst":
+                    # RST chunker
+                    file_chunks = chunk_rst(
+                        content,
+                        self.settings.chunk_size,
+                        self.settings.chunk_overlap
+                    )
+                else:
+                    # Markdown chunker
+                    file_chunks = chunk_markdown(
+                        content,
+                        self.settings.chunk_size,
+                        self.settings.chunk_overlap
+                    )
 
                 # Prepare chunks with metadata
-                relative_path = md_file.relative_to(source_path)
+                relative_path = file_path.relative_to(source_path)
 
                 for idx, chunk_text in enumerate(file_chunks):
                     content_hash = compute_content_hash(chunk_text)
