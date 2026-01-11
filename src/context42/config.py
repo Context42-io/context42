@@ -1,5 +1,26 @@
 """Configuration settings for Context42."""
 
+import os
+import logging
+import warnings
+
+# =============================================================================
+# Silence dependency internals (must be before any HF imports)
+# =============================================================================
+# Disable tqdm progress bars from huggingface_hub
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+# Disable telemetry
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# Silence huggingface_hub logger (warnings about authentication, etc.)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+# Suppress warning about HF_HUB_DISABLE_PROGRESS_BARS from tqdm
+warnings.filterwarnings("ignore", message=".*HF_HUB_DISABLE_PROGRESS_BARS.*")
+
+# =============================================================================
+
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from platformdirs import user_data_dir

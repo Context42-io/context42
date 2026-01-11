@@ -101,6 +101,21 @@ C42_BATCH_SIZE=50                              # Chunks per batch
 C42_DATA_DIR="~/.local/share/context42"        # Data directory
 ```
 
+## Advanced Configuration
+
+For users who need faster model downloads or encounter rate limiting:
+
+| Variable | Description |
+|----------|-------------|
+| `HF_TOKEN` | Hugging Face token for faster downloads and higher rate limits |
+
+```bash
+# Optional: Set HuggingFace token for faster downloads
+export HF_TOKEN="hf_your_token_here"
+```
+
+Get your token at: https://huggingface.co/settings/tokens
+
 ## Data Storage
 
 Context42 stores data in platform-specific locations:

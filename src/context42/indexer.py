@@ -655,9 +655,12 @@ class Embedder:
     def _ensure_model(self) -> None:
         """Lazy load model on first use."""
         if self._model is None:
-            console.print(f"[yellow]Loading embedding model: {self._model_name}...[/yellow]")
-            self._model = TextEmbedding(model_name=self._model_name)
-            console.print("[green]Model loaded successfully[/green]")
+            with console.status(
+                f"[yellow]Loading model: {self._model_name}[/yellow]",
+                spinner="dots"
+            ):
+                self._model = TextEmbedding(model_name=self._model_name)
+            console.print("[green]✓ Model loaded[/green]")
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """
