@@ -55,7 +55,7 @@ context42 = "context42.cli:app"
 [project.urls]
 Homepage = "https://github.com/context42-io/context42"
 Repository = "https://github.com/context42-io/context42"
-Changelog = "https://github.com/context42-io/context42/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/context42-io/context42/blob/master/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context42"]
